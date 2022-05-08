@@ -241,7 +241,7 @@ class BulkString(RESPType):
 
 
     def __str__(self) -> str:
-        return self._value
+        return str(self._value)
 
 
     def __repr__(self) -> str:
@@ -256,7 +256,7 @@ class BulkString(RESPType):
         `bytes`: binary encoded value of the string with a leading `$` byte and `\\r\\n` at the end.
         '''
 
-        return b"$" + self._value + b"\r\n"
+        return b"$" + str(len(self._value)).encode() + b"\r\n" + self._value + b"\r\n"
 
 
     def value(self) -> bytes:
@@ -307,7 +307,7 @@ class Error(RESPType):
 
 
     def __str__(self) -> str:
-        return self._prefix + ":" + self._message
+        return self._prefix + ": (" + self._message + ")"
 
 
     def __repr__(self) -> str:
@@ -504,11 +504,11 @@ class ClientConnection:
 
                 if line[0] == ord('-'):
 
-                    splitted = line[1:].split(' ')
+                    splitted = line[1:].split(b' ')
 
                     if len(splitted) > 1:
                         try:
-                            return Error(splitted[0], ' '.join(splitted[1:]))
+                            return Error(splitted[0], b' '.join(splitted[1:]))
                         except UnicodeDecodeError:
                             raise ClientConnection.ParsingError("Invalid Error format")
 
@@ -634,9 +634,9 @@ if __name__ == "__main__":
         try:
             await client.connect()
 
-            array = Array([BulkString("PUBLISH"), BulkString("test"), BulkString("smthng")])
+            array = Array([BulkString("GET"), BulkString("test2")])
 
-            await client.send(arr=array)
+            await client.send(array)
 
             response = await client.receive()
 
