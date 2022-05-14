@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 
 class RESPType:
@@ -321,7 +322,7 @@ class Error(RESPType):
         return:
         `bytes`: binary encoded value of the Error with a leading `-` byte and `\\r\\n` at the end.
         '''
-        return b"+" + self._prefix.encode() + b" " + self._message.encode() + b"\r\n"
+        return b"-" + self._prefix.encode() + b" " + self._message.encode() + b"\r\n"
 
 
     def prefix(self) -> str:
@@ -374,19 +375,19 @@ class Null(RESPType):
 
 
 
-class ClientConnection:
+class Connection:
     '''
-    RESP Client Connection class.
-    Provides API to create a TCP connection with a RESP server.
+    RESP Connection class.
     Provides API to send and receive RESP data objects through the connection.
+    Can be used to connect to a TCP server or use existing stream connection to use it in server implementation.
     '''
 
     class Error(Exception):
         '''
-        Base exception for other exceptions
+        Base exception for other exceptions.
         '''
 
-    class ClientDisconnected(Error):
+    class Disconnected(Error):
         '''
         Raised when trying to send or receive data while TCP connection closed.
         '''
@@ -394,46 +395,88 @@ class ClientConnection:
 
     class ParsingError(Error):
         '''
-        Raised when an error occurs when parsing received data from server.
+        Raised when an error occurs when parsing received data.
+        '''
+        pass
+
+    class TimeoutError(Error):
+        '''
+        Raised when an operation times out.
+        '''
+        pass
+
+    class ValueError(Error):
+        '''
+        Raised when an unexpected value is passed.
+        '''
+        pass
+
+    class ConnectionRefusedError(Error):
+        '''
+        Raised when TCP connection refused to open.
         '''
         pass
 
 
-    def __init__(self, host="127.0.0.1", port=6379) -> None:
+    def __init__(self) -> None:
         '''
-        Initialize the RESP client.
-        
-        args:
-        ``host``: Server host IP.
-        ``port``: Server port number.
+        New RESP Connection.
         '''
-
-        self.host=host
-        self.port=port
         self.reader=None
         self.writer=None
-        
         return
 
 
-    async def connect(self) -> None:
+    async def connect(self, host="127.0.0.1", port=6379):
         '''
-        Connect to the server.
+        Create new TCP connection with remote host.
+
+        args:
+        `host`: host name or IP.
+        `port`: port number.
 
         exceptions:
-        `ConnectionRefusedError`: connection to the server refused.
+        `ConnectionRefusedError`: connection to the specified host refused.
         
-        return: None.
+        return:
+        `Connection`: returns same connection object `self`.
+        '''
+        try:
+            self.reader, self.writer = await asyncio.open_connection(host=host, port=port)
+        except ConnectionRefusedError:
+            raise Connection.ConnectionRefusedError
+
+        return self
+
+
+    def setStream(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        '''
+        Set existing Stream connection as TCP connection.
+
+        args:
+        `reader`: Stream reader object to use.
+        `Writer`: Stream writer object to use.
+
+        exception:
+        `ValueError`: invalid args data types.
+
+        return:
+        `Connection`: returns same connection object `self`.
         '''
 
-        self.reader, self.writer = await asyncio.open_connection(host=self.host, port=self.port)
+        if not isinstance(reader, asyncio.StreamReader) or not isinstance(writer, asyncio.StreamWriter):
+            raise Connection.ValueError(f"expected (StreamReader, StreamWriter) got ({type(reader).__name__}, {type(writer).__name__})")
 
-        return
+        self.reader = reader
+        self.writer = writer
+
+        return self
+
 
 
     async def send(self, obj: Array) -> None:
         '''
-        Serialize ``obj`` and send it to server.
+        Serialize ``obj`` and send it through connection.
         Waits until data is transmitted. 
 
         args:
@@ -441,17 +484,17 @@ class ClientConnection:
 
         exceptions:
         ``ValueError``: obj argument not a RESP data type.
-        ``ClientDisconnected``: client not connected to server.
+        ``Disconnected``: connection closed.
 
         return: None.
         '''
 
         if not isinstance(obj, RESPType):
-            raise ValueError("obj should be one of RESP data types.")
+            raise Connection.ValueError("obj should be one of RESP data types.")
 
         if not self.connected():
             await self.disconnect()
-            raise ClientConnection.ClientDisconnected
+            raise Connection.Disconnected
 
         self.writer.write(obj.serialize())
         await self.writer.drain()
@@ -459,20 +502,21 @@ class ClientConnection:
         return
 
 
+
     async def receive(self, timeout: int =None) -> RESPType:
         '''
-        Wait for one RESP object from the server and parse it.
+        Wait for one RESP object and parse it.
 
         args:
         `timeout`: timeout period in seconds. if None, no timeout is imposed.
 
         exceptions:
-        `ParsingError`: Unexpected value received from server.
-        `ClientDisconnected`: Server closed connection before a valid RESP object was read.
+        `ParsingError`: Unexpected value received.
+        `Disconnected`: Connection closed before a valid RESP object was read.
         `TimeoutError`: Waiting for data timed out.
 
         return:
-        `RESPType`: the received RESP object.
+        `RESPType`: Received RESP object.
         '''
 
         try:
@@ -481,14 +525,14 @@ class ClientConnection:
                 try:
                     line = await asyncio.wait_for(self.reader.readuntil(b'\n'), timeout)
                 except asyncio.TimeoutError:
-                    raise TimeoutError
+                    raise Connection.TimeoutError
 
             else:
                 line = await self.reader.readuntil(b'\n')
 
 
             if line[-2] != ord('\r'):
-                raise ClientConnection.ParsingError("Line should end with \\r\\n")
+                raise Connection.ParsingError("Line should end with \\r\\n")
 
             line = line[:-2]
 
@@ -499,7 +543,7 @@ class ClientConnection:
                     try:
                         return SimpleString(line[1:])
                     except UnicodeDecodeError:
-                        raise ClientConnection.ParsingError("Invalid SimpleString format")
+                        raise Connection.ParsingError("Invalid SimpleString format")
                     
 
                 if line[0] == ord('-'):
@@ -510,49 +554,49 @@ class ClientConnection:
                         try:
                             return Error(splitted[0], b' '.join(splitted[1:]))
                         except UnicodeDecodeError:
-                            raise ClientConnection.ParsingError("Invalid Error format")
+                            raise Connection.ParsingError("Invalid Error format")
 
                     elif len(splitted) == 1:
                         try:
                             return Error(splitted[0], "")
                         except UnicodeDecodeError:
-                            raise ClientConnection.ParsingError("Invalid Error format")
+                            raise Connection.ParsingError("Invalid Error format")
 
                     else:
-                        raise ClientConnection.ParsingError("Invalid Error format")
+                        raise Connection.ParsingError("Invalid Error format")
 
 
                 if line[0] == ord(':'):
                     try:
                         return Integer(line[1:])
                     except ValueError:
-                        raise ClientConnection.ParsingError("Invalid Integer format")
+                        raise Connection.ParsingError("Invalid Integer format")
 
 
                 if line[0] == ord('$'):
                     try:
                         stringLength = Integer(line[1:])
                     except ValueError:
-                        raise ClientConnection.ParsingError("Invalid BulkString length formar")
+                        raise Connection.ParsingError("Invalid BulkString length formar")
 
                     if stringLength == -1:
                         return Null()
 
                     if stringLength < -1:
-                        raise ClientConnection.ParsingError("Invalid BulkString length format")
+                        raise Connection.ParsingError("Invalid BulkString length format")
 
 
                     if timeout:
                         try:
                             bulk = await asyncio.wait_for(self.reader.readexactly(stringLength + 2), timeout)
                         except asyncio.TimeoutError:
-                            raise TimeoutError
+                            raise Connection.TimeoutError
                     else:
                         bulk = await self.reader.readexactly(stringLength + 2)
 
 
                     if bulk[-2] != ord('\r') or bulk[-1] != ord('\n'):
-                        raise ClientConnection.ParsingError("BulkString should end with \\r\\n")
+                        raise Connection.ParsingError("BulkString should end with \\r\\n")
 
                     return BulkString(bulk[:-2])
 
@@ -561,13 +605,13 @@ class ClientConnection:
                     try:
                         arraySize = Integer(line[1:])
                     except ValueError:
-                        raise ClientConnection.ParsingError("Invalid Array size formar")
+                        raise Connection.ParsingError("Invalid Array size formar")
 
                     if arraySize == -1:
                         return Null()
 
                     if arraySize < -1:
-                        raise ClientConnection.ParsingError("Invalid Array size format")
+                        raise Connection.ParsingError("Invalid Array size format")
 
                     array = Array()
 
@@ -579,9 +623,10 @@ class ClientConnection:
 
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
             await self.disconnect()
-            raise ClientConnection.ClientDisconnected
+            raise Connection.Disconnected
 
         return
+
 
 
     def connected(self) -> bool:
@@ -589,7 +634,7 @@ class ClientConnection:
         Check connection status.
 
         return:
-        ``bool``: True if client connected, else return False.
+        ``bool``: True if connected, else return False.
 
         Note: if connected() returns False, disconnect() should be called for cleanup.
         '''
@@ -606,9 +651,10 @@ class ClientConnection:
         return True
 
 
+
     async def disconnect(self) -> None:
         '''
-        Disconnect from server.
+        Close connection.
 
         return: None.
         '''
@@ -625,16 +671,21 @@ class ClientConnection:
 
 
 
+
 if __name__ == "__main__":
 
-    async def main():
-
-        client = ClientConnection()
+    async def client():
 
         try:
-            await client.connect()
+            client = await Connection().connect()
+        
+        except Connection.ConnectionRefusedError:
+            logging.error("Connection to server refused.")
+            exit(1)
 
-            array = Array([BulkString("GET"), BulkString("test2")])
+        try:
+
+            array = Array([BulkString("SUBSCRIBE"), BulkString("test1"), BulkString("test2")])
 
             await client.send(array)
 
@@ -642,8 +693,51 @@ if __name__ == "__main__":
 
             print(type(response).__name__ + " ==> " + str(response))
 
+            response = await client.receive()
+
+            print(type(response).__name__ + " ==> " + str(response))
+
+            array = Array([BulkString("SUBSCRIBE"), BulkString("test3")])
+
+            await client.send(array)
+
+            response = await client.receive()
+
+            print(type(response[2]))
+
+            print(type(response).__name__ + " ==> " + str(response))
+
+        except Exception as e:
+            logging.error("Exception: " + str(e))
+
         finally:
             await client.disconnect()
 
 
-    asyncio.run(main())
+    async def stream():
+
+        try:
+            reader, writer = await asyncio.open_connection(host="localhost", port=6379)
+        
+        except ConnectionRefusedError:
+            logging.error("Connection to server refused.")
+            exit(1)
+
+        client = Connection().setStream(reader, writer)
+
+        try:
+            array = Array([BulkString("SET"), BulkString("test"), BulkString("123")])
+
+            await client.send(array)
+
+            response = await client.receive()
+
+            print(type(response).__name__ + " ==> " + str(response))
+
+        except Exception as e:
+            logging.error("Exception: " + str(e))
+
+        finally:
+            await client.disconnect()
+    
+    asyncio.run(stream())
